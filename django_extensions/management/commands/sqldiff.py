@@ -29,7 +29,7 @@ from django.apps import apps
 from django.core.management import BaseCommand, CommandError, sql as _sql
 from django.core.management.base import OutputWrapper
 from django.core.management.color import no_style
-from django.db import connection, transaction
+from django.db import connections, transaction
 from django.db.models.fields import AutoField, IntegerField
 
 from django_extensions.management.utils import signalcommand
@@ -53,11 +53,11 @@ def flatten(l, ltypes=(list, tuple)):
     return ltype(l)
 
 
-def all_local_fields(meta):
+def all_local_fields(meta, connection):
     all_fields = []
     if meta.proxy:
         for parent in meta.parents:
-            all_fields.extend(all_local_fields(parent._meta))
+            all_fields.extend(all_local_fields(parent._meta, connection))
     else:
         for f in meta.local_fields:
             col_type = f.db_type(connection=connection)
@@ -111,7 +111,7 @@ class SQLDiff(object):
 
     SQL_FIELD_MISSING_IN_DB = lambda self, style, qn, args: "%s %s\n\t%s %s %s;" % (style.SQL_KEYWORD('ALTER TABLE'), style.SQL_TABLE(qn(args[0])), style.SQL_KEYWORD('ADD COLUMN'), style.SQL_FIELD(qn(args[1])), ' '.join(style.SQL_COLTYPE(a) if i == 0 else style.SQL_KEYWORD(a) for i, a in enumerate(args[2:])))
     SQL_FIELD_MISSING_IN_MODEL = lambda self, style, qn, args: "%s %s\n\t%s %s;" % (style.SQL_KEYWORD('ALTER TABLE'), style.SQL_TABLE(qn(args[0])), style.SQL_KEYWORD('DROP COLUMN'), style.SQL_FIELD(qn(args[1])))
-    SQL_FKEY_MISSING_IN_DB = lambda self, style, qn, args: "%s %s\n\t%s %s %s %s %s (%s)%s;" % (style.SQL_KEYWORD('ALTER TABLE'), style.SQL_TABLE(qn(args[0])), style.SQL_KEYWORD('ADD COLUMN'), style.SQL_FIELD(qn(args[1])), ' '.join(style.SQL_COLTYPE(a) if i == 0 else style.SQL_KEYWORD(a) for i, a in enumerate(args[4:])), style.SQL_KEYWORD('REFERENCES'), style.SQL_TABLE(qn(args[2])), style.SQL_FIELD(qn(args[3])), connection.ops.deferrable_sql())
+    SQL_FKEY_MISSING_IN_DB = lambda self, style, qn, args: "%s %s\n\t%s %s %s %s %s (%s)%s;" % (style.SQL_KEYWORD('ALTER TABLE'), style.SQL_TABLE(qn(args[0])), style.SQL_KEYWORD('ADD COLUMN'), style.SQL_FIELD(qn(args[1])), ' '.join(style.SQL_COLTYPE(a) if i == 0 else style.SQL_KEYWORD(a) for i, a in enumerate(args[4:])), style.SQL_KEYWORD('REFERENCES'), style.SQL_TABLE(qn(args[2])), style.SQL_FIELD(qn(args[3])), self.connection.ops.deferrable_sql())
     SQL_INDEX_MISSING_IN_DB = lambda self, style, qn, args: "%s %s\n\t%s %s (%s%s);" % (style.SQL_KEYWORD('CREATE INDEX'), style.SQL_TABLE(qn("%s" % '_'.join(a for a in args[0:3] if a))), style.SQL_KEYWORD('ON'), style.SQL_TABLE(qn(args[0])), style.SQL_FIELD(qn(args[1])), style.SQL_KEYWORD(args[3]))
     # FIXME: need to lookup index name instead of just appending _idx to table + fieldname
     SQL_INDEX_MISSING_IN_MODEL = lambda self, style, qn, args: "%s %s;" % (style.SQL_KEYWORD('DROP INDEX'), style.SQL_TABLE(qn("%s" % '_'.join(a for a in args[0:3] if a))))
@@ -135,14 +135,15 @@ class SQLDiff(object):
         self.app_models = app_models
         self.options = options
         self.dense = options.get('dense_output', False)
+        self.connection = connections[options['db_name']]
 
         try:
-            self.introspection = connection.introspection
+            self.introspection = self.connection.introspection
         except AttributeError:
             from django.db import get_introspection_module
             self.introspection = get_introspection_module()
 
-        self.cursor = connection.cursor()
+        self.cursor = self.connection.cursor()
         self.django_tables = self.get_django_tables(options.get('only_existing', True))
         # TODO: We are losing information about tables which are views here
         self.db_tables = [table_info.name for table_info in self.introspection.get_table_list(self.cursor)]
@@ -206,7 +207,7 @@ class SQLDiff(object):
 
         code from snippet at http://www.djangosnippets.org/snippets/1383/
         """
-        cursor = connection.cursor()
+        cursor = self.connection.cursor()
         cursor.execute(query, param)
         fieldnames = [name[0] for name in cursor.description]
         result = []
@@ -218,7 +219,7 @@ class SQLDiff(object):
         return result
 
     def get_field_model_type(self, field):
-        return field.db_type(connection=connection)
+        return field.db_type(connection=self.connection)
 
     def get_field_db_type(self, description, field=None, table_name=None):
         from django.db import models
@@ -270,9 +271,9 @@ class SQLDiff(object):
         if '.' in reverse_type:
             module_path, package_name = reverse_type.rsplit('.', 1)
             module = importlib.import_module(module_path)
-            field_db_type = getattr(module, package_name)(**kwargs).db_type(connection=connection)
+            field_db_type = getattr(module, package_name)(**kwargs).db_type(connection=self.connection)
         else:
-            field_db_type = getattr(models, reverse_type)(**kwargs).db_type(connection=connection)
+            field_db_type = getattr(models, reverse_type)(**kwargs).db_type(connection=self.connection)
 
         tablespace = field.db_tablespace
         if not tablespace:
@@ -298,7 +299,7 @@ class SQLDiff(object):
         return field_type
 
     def find_unique_missing_in_db(self, meta, table_indexes, table_constraints, table_name):
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             if field.unique and meta.managed:
                 attname = field.db_column or field.attname
                 db_field_unique = table_indexes.get(attname, {}).get('unique')
@@ -311,7 +312,7 @@ class SQLDiff(object):
     def find_unique_missing_in_model(self, meta, table_indexes, table_constraints, table_name):
         # TODO: Postgresql does not list unique_togethers in table_indexes
         #       MySQL does
-        fields = dict([(field.db_column or field.name, field.unique) for field in all_local_fields(meta)])
+        fields = dict([(field.db_column or field.name, field.unique) for field in all_local_fields(meta, self.connection)])
         for att_name, att_opts in six.iteritems(table_indexes):
             db_field_unique = att_opts['unique']
             if not db_field_unique and table_constraints:
@@ -322,19 +323,19 @@ class SQLDiff(object):
                 self.add_difference('unique-missing-in-model', table_name, att_name)
 
     def find_index_missing_in_db(self, meta, table_indexes, table_constraints, table_name):
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             if field.db_index:
                 attname = field.db_column or field.attname
                 if attname not in table_indexes:
                     self.add_difference('index-missing-in-db', table_name, attname, '', '')
-                    db_type = field.db_type(connection=connection)
+                    db_type = field.db_type(connection=self.connection)
                     if db_type.startswith('varchar'):
                         self.add_difference('index-missing-in-db', table_name, attname, 'like', ' varchar_pattern_ops')
                     if db_type.startswith('text'):
                         self.add_difference('index-missing-in-db', table_name, attname, 'like', ' text_pattern_ops')
 
     def find_index_missing_in_model(self, meta, table_indexes, table_constraints, table_name):
-        fields = dict([(field.name, field) for field in all_local_fields(meta)])
+        fields = dict([(field.name, field) for field in all_local_fields(meta, self.connection)])
         for att_name, att_opts in six.iteritems(table_indexes):
             if att_name in fields:
                 field = fields[att_name]
@@ -352,7 +353,7 @@ class SQLDiff(object):
                 if db_field_unique and att_name in flatten(meta.unique_together):
                     continue
                 self.add_difference('index-missing-in-model', table_name, att_name)
-                db_type = field.db_type(connection=connection)
+                db_type = field.db_type(connection=self.connection)
                 if db_type.startswith('varchar') or db_type.startswith('text'):
                     self.add_difference('index-missing-in-model', table_name, att_name, 'like')
 
@@ -371,7 +372,7 @@ class SQLDiff(object):
                     op = 'fkey-missing-in-db'
                 else:
                     op = 'field-missing-in-db'
-                field_output.append(field.db_type(connection=connection))
+                field_output.append(field.db_type(connection=self.connection))
                 if not field.null:
                     field_output.append('NOT NULL')
                 self.add_difference(op, table_name, field_name, *field_output)
@@ -379,7 +380,7 @@ class SQLDiff(object):
 
     def find_field_type_differ(self, meta, table_description, table_name, func=None):
         db_fields = dict([(row[0], row) for row in table_description])
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             if field.name not in db_fields:
                 continue
             description = db_fields[field.name]
@@ -396,7 +397,7 @@ class SQLDiff(object):
 
     def find_field_parameter_differ(self, meta, table_description, table_name, func=None):
         db_fields = dict([(row[0], row) for row in table_description])
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             if field.name not in db_fields:
                 continue
             description = db_fields[field.name]
@@ -411,7 +412,7 @@ class SQLDiff(object):
             if func:
                 model_type, db_type = func(field, description, model_type, db_type)
 
-            model_check = field.db_parameters(connection=connection)['check']
+            model_check = field.db_parameters(connection=self.connection)['check']
             if ' CHECK' in db_type:
                 db_type, db_check = db_type.split(" CHECK", 1)
                 db_check = db_check.strip().lstrip("(").rstrip(")")
@@ -424,7 +425,7 @@ class SQLDiff(object):
         if not self.can_detect_notnull_differ:
             return
 
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             attname = field.db_column or field.attname
             if (table_name, attname) in self.new_db_fields:
                 continue
@@ -467,7 +468,7 @@ class SQLDiff(object):
             else:
                 table_constraints = self.get_constraints(self.cursor, table_name, self.introspection)
 
-            fieldmap = dict([(field.db_column or field.get_attname(), field) for field in all_local_fields(meta)])
+            fieldmap = dict([(field.db_column or field.get_attname(), field) for field in all_local_fields(meta, self.connection)])
 
             # add ordering field if model uses order_with_respect_to
             if meta.order_with_respect_to:
@@ -548,7 +549,7 @@ class SQLDiff(object):
             print("")
 
         cur_app_label = None
-        qn = connection.ops.quote_name
+        qn = self.connection.ops.quote_name
         if not self.has_differences:
             if not self.dense:
                 print(style.SQL_KEYWORD("-- No differences"))
@@ -662,7 +663,7 @@ class SqliteSQLDiff(SQLDiff):
     # if this is more generic among databases this might be usefull
     # to add to the superclass's find_unique_missing_in_db method
     def find_unique_missing_in_db(self, meta, table_indexes, table_constraints, table_name):
-        for field in all_local_fields(meta):
+        for field in all_local_fields(meta, self.connection):
             if field.unique:
                 attname = field.db_column or field.attname
                 if attname in table_indexes and table_indexes[attname]['unique']:
@@ -922,6 +923,10 @@ to check/debug ur models compared to the real database tables and columns."""
             '--include-proxy-models', action='store_true', dest='include_proxy_models',
             default=False,
             help="Include proxy models in the graph")
+        parser.add_argument(
+            '--db-name', '-db', dest='db_name',
+            default='default',
+            help="Uses this key defined in your settings' DATABASES dictionary")
 
     def __init__(self, *args, **kwargs):
         super(Command, self).__init__(*args, **kwargs)
@@ -934,7 +939,7 @@ to check/debug ur models compared to the real database tables and columns."""
         app_labels = options.get('app_label')
         engine = None
         if hasattr(settings, 'DATABASES'):
-            engine = settings.DATABASES['default']['ENGINE']
+            engine = settings.DATABASES[options['db_name']]['ENGINE']
         else:
             engine = settings.DATABASE_ENGINE
 
@@ -944,6 +949,8 @@ to check/debug ur models compared to the real database tables and columns."""
             raise CommandError("""Django doesn't know which syntax to use for your SQL statements,
 because you haven't specified the DATABASE_ENGINE setting.
 Edit your settings file and change DATABASE_ENGINE to something like 'postgresql' or 'mysql'.""")
+
+        self.connection = connections[options['db_name']]
 
         if options.get('all_applications', False):
             app_models = apps.get_models(include_auto_created=True)
@@ -963,7 +970,7 @@ Edit your settings file and change DATABASE_ENGINE to something like 'postgresql
             raise CommandError('Unable to execute sqldiff no models founds.')
 
         if not engine:
-            engine = connection.__module__.split('.')[-2]
+            engine = self.connection.__module__.split('.')[-2]
 
         if '.' in engine:
             engine = engine.split('.')[-1]
